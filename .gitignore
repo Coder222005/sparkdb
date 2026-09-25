@@ -1,0 +1,39 @@
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build and Distribution Packages
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Database and Storage Test Data
+data/
+*.db
+*.db-wal
+*.db-shm
+*.aof
+*.snapshot.json
+
+# IDE and Editor Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker volumes and local dependencies
+docker/sparkdb_deps/

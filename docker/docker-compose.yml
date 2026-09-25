@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  sparkdb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.sparkdb
+    image: sparkdb:latest
+    container_name: sparkdb_container
+    ports:
+      - "7379:7379"
+    volumes:
+      - /home/ebomven/poc/data/sparkdb:/data/sparkdb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:7379/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

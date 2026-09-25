@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sparkdb"
+version = "1.1.0"
+description = "Fast GraphBLAS Sparse Linear Algebra Graph Database (Clean-Room / Zero-SSPL)"
+authors = [
+    { name = "Bommireddy Venkata Dheeraj Reddy", email = "bommireddyvenkatadheerajreddy@gmail.com" },
+]
+maintainers = [
+    { name = "Ruthwik", email = "ruthwik4566@gmail.com" },
+]
+license = { text = "BSD-3-Clause" }
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["graph-database", "graphblas", "cypher", "vector-search", "hnsw", "knowledge-graph"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database :: Database Engines/Servers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+server = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "hnswlib>=0.8.0"
+]
+
+[project.scripts]
+sparkdb-cli = "sparkdb.cli:main"
+sparkdb-server = "sparkdb.server.server:run_server"
+
+[tool.setuptools.packages.find]
+include = ["sparkdb*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".", "app", "sparkdb"]
+testpaths = ["tests"]
+

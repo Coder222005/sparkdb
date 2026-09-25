@@ -1,0 +1,22 @@
+# SparkDB Production Container Image
+# Fast, In-Memory & Hybrid GraphBLAS Linear Algebra Graph Database (BSD 3-Clause / Apache 2.0)
+FROM node:20-bookworm
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+ENV SPARKDB_PORT=7379
+ENV SPARKDB_STORAGE=/data/sparkdb
+ENV PYTHONPATH=/app/deps:/app
+
+# Copy pure native dependencies and SparkDB package
+COPY docker/sparkdb_deps /app/deps
+COPY sparkdb /app/sparkdb
+
+VOLUME ["/data/sparkdb"]
+EXPOSE 7379
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:7379/health')" || exit 1
+
+ENTRYPOINT ["python3", "-m", "sparkdb.server.server", "0.0.0.0", "7379", "/data/sparkdb"]
