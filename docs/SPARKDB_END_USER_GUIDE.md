@@ -13,32 +13,29 @@
 
 The SparkDB client SDK is packaged as a pure-Python, zero-dependency wheel. It requires **no C compilers, no numpy, and no heavy dependencies** on the client machine—it uses standard Python 3.8+ libraries (`urllib` and `json`).
 
-### Method A: Direct Wheel Installation (Recommended for Teams)
-Transfer the wheel file `sparkdb-1.1.0-py3-none-any.whl` (located in `dist/` on the server) to the developer's laptop or VM, then run:
+### Method A: Install via PyPI (Recommended)
+SparkDB is officially published on PyPI:
 
 ```bash
-pip install sparkdb-1.1.0-py3-none-any.whl
+pip install sparkdb
 ```
 
-To upgrade in the future:
+To install with optional server dependencies (NumPy, SciPy, HNSW vector search):
 ```bash
-pip install --upgrade --force-reinstall sparkdb-1.1.0-py3-none-any.whl
+pip install "sparkdb[server]"
 ```
 
-### Method B: Install via Internal Artifact Repository (Artifactory / Nexus / Azure Artifacts)
-If your organization hosts an internal PyPI mirror or Artifactory feed:
+### Method B: Install from Source
 ```bash
-# Upload wheel to your company registry (one-time by admin):
-twine upload --repository-url https://pkgs.dev.azure.com/YourOrg/_packaging/your_feed/pypi/upload/ dist/sparkdb-1.1.0-py3-none-any.whl
-
-# Developers install directly:
-pip install sparkdb --index-url https://pkgs.dev.azure.com/YourOrg/_packaging/your_feed/pypi/simple/
+git clone https://github.com/Coder222005/sparkdb.git
+cd sparkdb
+pip install .
 ```
 
 ### Method C: Standalone Single-File Drop-In (Zero `pip` required)
-If a developer cannot use `pip`, they can copy `sparkdb/client.py` directly into their project repository as `sparkdb_client.py` and import `SparkDB` directly:
+If you cannot use `pip`, simply copy `sparkdb/client/remote_client.py` directly into your project repository and import `SparkDB`:
 ```python
-from sparkdb_client import SparkDBClient as SparkDB
+from remote_client import SparkDBClient as SparkDB
 ```
 
 ---

@@ -9,7 +9,7 @@
 ### 1.1 Annotated Directory Tree
 
 ```
-sparkdb_dev/                         ← project root (pyproject.toml lives here)
+sparkdb/                             ← project root (pyproject.toml lives here)
 │
 ├── pyproject.toml                   ← PEP 621 build manifest (setuptools, entry-points)
 ├── README.md                        ← High-level project overview
