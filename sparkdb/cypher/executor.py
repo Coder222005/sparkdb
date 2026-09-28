@@ -54,6 +54,16 @@ class CypherExecutor:
         self.graph = graph_space
 
     def execute(self, query: str, params: Optional[Dict[str, Any]] = None) -> QueryResult:
+        stmt = CypherParser.parse(query, params=params)
+        mutating = stmt.type in {"CREATE", "MERGE"}
+        if stmt.type == "MATCH":
+            mutating = bool(stmt.details.get("set") or stmt.details.get("remove") or stmt.details.get("delete"))
+        if mutating:
+            with self.graph.transaction():
+                return self._execute_once(query, params=params)
+        return self._execute_once(query, params=params)
+
+    def _execute_once(self, query: str, params: Optional[Dict[str, Any]] = None) -> QueryResult:
         """Parse and execute a Cypher query with optional parameters."""
         t0 = time.perf_counter()
         stmt = CypherParser.parse(query, params=params)
@@ -173,7 +183,7 @@ class CypherExecutor:
             nodes_created = 0
             for op in on_match_set:
                 if "prop" in op:
-                    self.graph.property_store.set_node_properties(nid, {op["prop"]: op["val"]})
+                    self.graph.set_node_properties(nid, {op["prop"]: op["val"]})
                     props_set += 1
                 elif "label" in op:
                     if hasattr(self.graph, "add_node_label"):
@@ -188,7 +198,7 @@ class CypherExecutor:
             props_set = len(props) + (1 if emb else 0)
             for op in on_create_set:
                 if "prop" in op:
-                    self.graph.property_store.set_node_properties(nid, {op["prop"]: op["val"]})
+                    self.graph.set_node_properties(nid, {op["prop"]: op["val"]})
                     props_set += 1
                 elif "label" in op:
                     if hasattr(self.graph, "add_node_label"):
@@ -541,11 +551,11 @@ class CypherExecutor:
                     pk, pv = op["prop"], op["val"]
                     if v in node_var_to_id:
                         nid = node_var_to_id[v]
-                        self.graph.property_store.set_node_properties(nid, {pk: pv})
+                        self.graph.set_node_properties(nid, {pk: pv})
                         props_set_count += 1
                     elif v in edge_var_to_tuple:
                         src, r_type, dst = edge_var_to_tuple[v]
-                        self.graph.property_store.set_edge_properties(src, r_type, dst, {pk: pv})
+                        self.graph.set_edge_properties(src, r_type, dst, {pk: pv})
                         props_set_count += 1
                 elif "label" in op:
                     lbl = op["label"]
@@ -563,19 +573,11 @@ class CypherExecutor:
                     pk = op["prop"]
                     if v in node_var_to_id:
                         nid = node_var_to_id[v]
-                        curr = self.graph.property_store.get_node_properties(nid)
-                        if pk in curr:
-                            del curr[pk]
-                            self.graph.property_store.delete_node_properties(nid)
-                            self.graph.property_store.set_node_properties(nid, curr)
+                        if self.graph.remove_node_property(nid, pk):
                             props_set_count += 1
                     elif v in edge_var_to_tuple:
                         src, r_type, dst = edge_var_to_tuple[v]
-                        ecurr = self.graph.property_store.get_edge_properties(src, r_type, dst)
-                        if pk in ecurr:
-                            del ecurr[pk]
-                            if hasattr(self.graph.property_store, "edge_properties"):
-                                self.graph.property_store.edge_properties[(src, r_type, dst)] = ecurr
+                        if self.graph.remove_edge_property(src, r_type, dst, pk):
                             props_set_count += 1
                 elif "label" in op:
                     lbl = op["label"]
@@ -755,18 +757,74 @@ class CypherExecutor:
     def _evaluate_where(self, where_str: str, var_map: Dict[str, Dict[str, Any]]) -> bool:
         if not where_str:
             return True
+        expression = where_str.strip()
 
-        or_parts = re.split(r"\bOR\b", where_str, flags=re.IGNORECASE)
-        for or_part in or_parts:
-            and_parts = re.split(r"\bAND\b", or_part, flags=re.IGNORECASE)
-            all_and = True
-            for cond in and_parts:
-                if not self._eval_single_condition(cond.strip(), var_map):
-                    all_and = False
+        def strip_outer_parentheses(value: str) -> str:
+            while value.startswith("(") and value.endswith(")"):
+                depth = 0
+                quoted = None
+                closes_at_end = True
+                for index, char in enumerate(value):
+                    if quoted:
+                        if char == quoted and (index == 0 or value[index - 1] != "\\"):
+                            quoted = None
+                        continue
+                    if char in ("'", '"'):
+                        quoted = char
+                    elif char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                        if depth == 0 and index != len(value) - 1:
+                            closes_at_end = False
+                            break
+                if closes_at_end and depth == 0:
+                    value = value[1:-1].strip()
+                else:
                     break
-            if all_and:
-                return True
-        return False
+            return value
+
+        def split_top_level(value: str, operator: str) -> List[str]:
+            parts: List[str] = []
+            start = 0
+            depth = 0
+            quoted = None
+            index = 0
+            pattern = re.compile(rf"\b{operator}\b", re.IGNORECASE)
+            while index < len(value):
+                char = value[index]
+                if quoted:
+                    if char == quoted and (index == 0 or value[index - 1] != "\\"):
+                        quoted = None
+                    index += 1
+                    continue
+                if char in ("'", '"'):
+                    quoted = char
+                    index += 1
+                    continue
+                if char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                elif depth == 0:
+                    match = pattern.match(value, index)
+                    if match:
+                        parts.append(value[start:index].strip())
+                        start = match.end()
+                        index = match.end()
+                        continue
+                index += 1
+            parts.append(value[start:].strip())
+            return parts
+
+        expression = strip_outer_parentheses(expression)
+        or_parts = split_top_level(expression, "OR")
+        if len(or_parts) > 1:
+            return any(self._evaluate_where(part, var_map) for part in or_parts)
+        and_parts = split_top_level(expression, "AND")
+        if len(and_parts) > 1:
+            return all(self._evaluate_where(part, var_map) for part in and_parts)
+        return self._eval_single_condition(expression, var_map)
 
     def _eval_single_condition(self, cond: str, var_map: Dict[str, Dict[str, Any]]) -> bool:
         cond = cond.strip()

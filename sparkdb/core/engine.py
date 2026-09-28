@@ -5,12 +5,14 @@ FulltextStore, and PersistenceEngine for multi-tenant, durable, high-performance
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .matrix_store import MatrixStore
@@ -75,6 +77,18 @@ class GraphSpace:
                     self.delete_node(p.get("node_id"), log_aof=False)
                 elif cmd == "delete_edge":
                     self.delete_edge(p.get("src"), p.get("rel"), p.get("dst"), log_aof=False)
+                elif cmd == "set_node_properties":
+                    self.set_node_properties(p.get("node_id"), p.get("properties", {}), log_aof=False)
+                elif cmd == "set_edge_properties":
+                    self.set_edge_properties(p.get("src"), p.get("rel"), p.get("dst"), p.get("properties", {}), log_aof=False)
+                elif cmd == "remove_node_property":
+                    self.remove_node_property(p.get("node_id"), p.get("property"), log_aof=False)
+                elif cmd == "remove_edge_property":
+                    self.remove_edge_property(p.get("src"), p.get("rel"), p.get("dst"), p.get("property"), log_aof=False)
+                elif cmd == "add_node_label":
+                    self.add_node_label(p.get("node_id"), p.get("label"), log_aof=False)
+                elif cmd == "remove_node_label":
+                    self.remove_node_label(p.get("node_id"), p.get("label"), log_aof=False)
                 elif cmd == "create_batch":
                     for n in p.get("nodes", []):
                         self.create_node(n.get("labels"), n.get("properties"), n.get("embedding"), log_aof=False)
@@ -88,7 +102,7 @@ class GraphSpace:
             # Nodes
             for n_entry in data.get("nodes", []):
                 lbls = n_entry.get("labels", [])
-                nid = self.matrix_store.add_node(labels=lbls)
+                nid = self.matrix_store.add_node(labels=lbls, node_id=n_entry.get("id"))
                 for lbl in lbls:
                     self.label_counts[lbl] = self.label_counts.get(lbl, 0) + 1
                 props = n_entry.get("properties", {})
@@ -97,6 +111,13 @@ class GraphSpace:
                     self.vector_store.add_node_vector(nid, n_entry["embedding"])
                 if "text" in props:
                     self.fulltext_store.index_node_text(nid, str(props["text"]))
+
+            self.matrix_store.node_count = max(
+                self.matrix_store.node_count,
+                int(data.get("node_count", self.matrix_store.node_count)),
+            )
+            self.matrix_store.node_capacity = max(self.matrix_store.node_capacity, self.matrix_store.node_count)
+            self.matrix_store.rebuild_free_node_ids()
 
             # Edges
             for e_entry in data.get("edges", []):
@@ -109,6 +130,36 @@ class GraphSpace:
                 if props:
                     self.property_store.set_edge_properties(src, rel, dst, props)
 
+    def _reset_state(self) -> None:
+        """Reset mutable stores before restoring a transaction snapshot."""
+        previous_store = self.property_store
+        clear = getattr(previous_store, "clear", None)
+        if clear:
+            clear()
+        self.matrix_store = MatrixStore()
+        self.property_store = previous_store
+        self.vector_store = VectorStore(dimension=self.vector_dim)
+        self.fulltext_store = FulltextStore()
+        self.label_counts = {}
+
+    @contextmanager
+    def transaction(self):
+        """Run a mutation atomically, restoring stores and AOF on failure."""
+        with self._lock:
+            snapshot = self.to_dict()
+            aof_path = self.persistence.aof_file
+            aof_size = os.path.getsize(aof_path) if os.path.exists(aof_path) else 0
+            try:
+                yield
+            except Exception:
+                self._reset_state()
+                self._restore_from_dict(snapshot)
+                self.persistence.close()
+                if os.path.exists(aof_path):
+                    with open(aof_path, "r+b") as handle:
+                        handle.truncate(aof_size)
+                raise
+
     def batch_get_nodes_properties(self, node_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Batch fetch node properties via underlying property store."""
         return self.property_store.batch_get_nodes_properties(node_ids)
@@ -117,16 +168,16 @@ class GraphSpace:
         """Serialize complete state into dictionary for snapshotting."""
         with self._lock:
             nodes_data = []
-            active_nodes = self.matrix_store.get_active_nodes()
+            active_nodes = sorted(self.matrix_store.get_active_nodes())
             all_props = self.property_store.batch_get_nodes_properties(active_nodes)
             for nid in active_nodes:
                 props = all_props.get(nid, {})
                 lbls = list(self.matrix_store.node_to_labels.get(nid, set()))
-                vec = self.vector_store._vectors.get(nid)
+                vec = self.vector_store.get_vector(nid)
                 nodes_data.append({
                     "id": nid,
                     "labels": lbls,
-                    "properties": props,
+                    "properties": copy.deepcopy(props),
                     "embedding": vec.tolist() if vec is not None else None,
                 })
 
@@ -140,7 +191,7 @@ class GraphSpace:
                         "rel": rel,
                         "dst": dst,
                         "weight": float(weight),
-                        "properties": props,
+                        "properties": copy.deepcopy(props),
                     })
 
             return {
@@ -152,8 +203,37 @@ class GraphSpace:
 
     def checkpoint(self) -> str:
         """Trigger an atomic disk snapshot."""
-        state = self.to_dict()
-        return self.persistence.save_snapshot(state)
+        with self._lock:
+            active_nodes = sorted(self.matrix_store.get_active_nodes())
+
+            def node_stream():
+                for nid in active_nodes:
+                    props = self.property_store.get_node_properties(nid)
+                    vec = self.vector_store.get_vector(nid)
+                    yield {
+                        "id": nid,
+                        "labels": list(self.matrix_store.node_to_labels.get(nid, set())),
+                        "properties": props,
+                        "embedding": vec.tolist() if vec is not None else None,
+                    }
+
+            def edge_stream():
+                for rel in self.matrix_store.get_relationship_types():
+                    for (src, dst), weight in self.matrix_store._rel_matrices[rel].items():
+                        yield {
+                            "src": src,
+                            "rel": rel,
+                            "dst": dst,
+                            "weight": float(weight),
+                            "properties": copy.deepcopy(self.property_store.get_edge_properties(src, rel, dst)),
+                        }
+
+            return self.persistence.save_snapshot_stream(
+                self.name,
+                self.matrix_store.node_count,
+                node_stream(),
+                edge_stream(),
+            )
 
     def load_schema(self, schema_dict_or_path: Dict[str, Any] | str) -> None:
         """Enforce ontology schema constraints."""
@@ -260,20 +340,53 @@ class GraphSpace:
                     self.persistence.append_mutation("delete_node", {"node_id": node_id})
             return success
 
-    def add_node_label(self, node_id: int, label: str) -> None:
+    def set_node_properties(self, node_id: int, properties: Dict[str, Any], log_aof: bool = True) -> None:
+        with self._lock:
+            self.property_store.set_node_properties(node_id, properties)
+            if log_aof:
+                self.persistence.append_mutation("set_node_properties", {
+                    "node_id": node_id,
+                    "properties": properties,
+                })
+
+    def remove_node_property(self, node_id: int, property_name: str, log_aof: bool = True) -> bool:
+        with self._lock:
+            current = dict(self.property_store.get_node_properties(node_id))
+            if property_name not in current:
+                return False
+            del current[property_name]
+            self.property_store.delete_node_properties(node_id)
+            if current:
+                self.property_store.set_node_properties(node_id, current)
+            if log_aof:
+                self.persistence.append_mutation("remove_node_property", {
+                    "node_id": node_id,
+                    "property": property_name,
+                })
+            return True
+
+    def add_node_label(self, node_id: int, label: str, log_aof: bool = True) -> None:
         """Add a label to an active node and update cardinality statistics."""
         with self._lock:
+            if label in self.matrix_store.node_to_labels.get(node_id, set()):
+                return
             self.matrix_store.add_node_label(node_id, label)
             self.label_counts[label] = self.label_counts.get(label, 0) + 1
+            if log_aof:
+                self.persistence.append_mutation("add_node_label", {"node_id": node_id, "label": label})
 
-    def remove_node_label(self, node_id: int, label: str) -> None:
+    def remove_node_label(self, node_id: int, label: str, log_aof: bool = True) -> None:
         """Remove a label from an active node and update cardinality statistics."""
         with self._lock:
+            if label not in self.matrix_store.node_to_labels.get(node_id, set()):
+                return
             self.matrix_store.remove_node_label(node_id, label)
             if label in self.label_counts:
                 self.label_counts[label] = max(0, self.label_counts[label] - 1)
                 if self.label_counts[label] == 0:
                     del self.label_counts[label]
+            if log_aof:
+                self.persistence.append_mutation("remove_node_label", {"node_id": node_id, "label": label})
 
     def get_label_count(self, label: str) -> int:
         """Get the current count of nodes with the specified label."""
@@ -361,13 +474,55 @@ class GraphSpace:
                     "src": src, "rel": rel, "dst": dst, "weight": weight, "properties": properties,
                 })
 
+    def set_edge_properties(
+        self,
+        src: int,
+        rel: str,
+        dst: int,
+        properties: Dict[str, Any],
+        log_aof: bool = True,
+    ) -> None:
+        with self._lock:
+            self.property_store.set_edge_properties(src, rel, dst, properties)
+            if log_aof:
+                self.persistence.append_mutation("set_edge_properties", {
+                    "src": src,
+                    "rel": rel,
+                    "dst": dst,
+                    "properties": properties,
+                })
+
+    def remove_edge_property(
+        self,
+        src: int,
+        rel: str,
+        dst: int,
+        property_name: str,
+        log_aof: bool = True,
+    ) -> bool:
+        with self._lock:
+            current = dict(self.property_store.get_edge_properties(src, rel, dst))
+            if property_name not in current:
+                return False
+            del current[property_name]
+            self.property_store.delete_edge_properties(src, rel, dst)
+            if current:
+                self.property_store.set_edge_properties(src, rel, dst, current)
+            if log_aof:
+                self.persistence.append_mutation("remove_edge_property", {
+                    "src": src,
+                    "rel": rel,
+                    "dst": dst,
+                    "property": property_name,
+                })
+            return True
+
     def delete_edge(self, src: int, rel: str, dst: int, log_aof: bool = True) -> bool:
         """Remove an edge."""
         with self._lock:
             success = self.matrix_store.delete_edge(src, rel, dst)
             if success:
-                if hasattr(self.property_store, "edge_properties"):
-                    self.property_store.edge_properties.pop((src, rel, dst), None)
+                self.property_store.delete_edge_properties(src, rel, dst)
                 if log_aof:
                     self.persistence.append_mutation("delete_edge", {"src": src, "rel": rel, "dst": dst})
             return success

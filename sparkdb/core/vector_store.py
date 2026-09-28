@@ -29,10 +29,17 @@ class VectorStore:
         self.max_elements = max_elements
         self._index: Optional[Any] = None
         self._vectors: Dict[int, np.ndarray] = {}
+        self._vector_ids: set[int] = set()
+        self._deleted_ids: set[int] = set()
 
         if HNSWLIB_AVAILABLE:
             self._index = hnswlib.Index(space=self.space, dim=self.dimension)
-            self._index.init_index(max_elements=self.max_elements, ef_construction=200, M=16)
+            self._index.init_index(
+                max_elements=self.max_elements,
+                ef_construction=200,
+                M=16,
+                allow_replace_deleted=True,
+            )
             self._index.set_ef(50)
 
     def add_node_vector(self, node_id: int, vector: List[float] | np.ndarray) -> None:
@@ -42,32 +49,43 @@ class VectorStore:
             if vec.shape[0] != self.dimension:
                 raise ValueError(f"Vector dim {vec.shape[0]} does not match index dim {self.dimension}")
 
-            self._vectors[node_id] = vec
             if self._index is not None:
-                if len(self._vectors) > self.max_elements:
+                if len(self._vector_ids) >= self.max_elements:
                     self.max_elements *= 2
                     self._index.resize_index(self.max_elements)
-                self._index.add_items([vec], [node_id])
+                self._index.add_items(
+                    [vec],
+                    [node_id],
+                    replace_deleted=node_id in self._deleted_ids,
+                )
+                self._deleted_ids.discard(node_id)
+                self._vector_ids.add(node_id)
+            else:
+                self._vectors[node_id] = vec
 
     def delete_node_vector(self, node_id: int) -> None:
         """Remove a vector for a node."""
         with self._lock:
-            if node_id in self._vectors:
-                del self._vectors[node_id]
-                if self._index is not None:
-                    try:
-                        self._index.mark_deleted(node_id)
-                    except Exception:
-                        pass
+            self._vectors.pop(node_id, None)
+            if self._index is not None:
+                try:
+                    self._index.mark_deleted(node_id)
+                    self._vector_ids.discard(node_id)
+                    self._deleted_ids.add(node_id)
+                except Exception:
+                    pass
+            else:
+                self._vector_ids.discard(node_id)
 
     def query_nearest_nodes(self, query_vector: List[float] | np.ndarray, top_k: int = 5) -> List[Tuple[int, float]]:
         """Query top-k nearest nodes with their similarity / distance scores."""
         with self._lock:
-            if not self._vectors:
+            vector_count = len(self._vector_ids) if self._index is not None else len(self._vectors)
+            if not vector_count:
                 return []
 
             q_vec = np.asarray(query_vector, dtype=np.float32)
-            k = min(top_k, len(self._vectors))
+            k = min(top_k, vector_count)
 
             if self._index is not None:
                 try:
@@ -86,3 +104,14 @@ class VectorStore:
 
             results.sort(key=lambda x: x[1])
             return results[:k]
+
+    def get_vector(self, node_id: int) -> Optional[np.ndarray]:
+        """Return a copy of a stored vector for persistence or inspection."""
+        with self._lock:
+            if self._index is not None and node_id in self._vector_ids:
+                try:
+                    return np.asarray(self._index.get_items([node_id])[0], dtype=np.float32)
+                except Exception:
+                    return None
+            vector = self._vectors.get(node_id)
+            return None if vector is None else vector.copy()

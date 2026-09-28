@@ -134,6 +134,10 @@ class PropertyStore:
                 self.edge_properties[key] = {}
             self.edge_properties[key].update(properties)
 
+    def delete_edge_properties(self, src: int, rel_type: str, dst: int) -> None:
+        with self._lock:
+            self.edge_properties.pop((src, rel_type, dst), None)
+
     def get_edge_properties(self, src: int, rel_type: str, dst: int) -> Dict[str, Any]:
         """Retrieve properties for an edge."""
         with self._lock:
@@ -180,6 +184,14 @@ class PropertyStore:
                     matched.add(nid)
             return matched
 
+    def clear(self) -> None:
+        """Remove all stored values while preserving configured in-memory indexes."""
+        with self._lock:
+            self.node_properties.clear()
+            self.edge_properties.clear()
+            for index in self._property_indexes.values():
+                index.clear()
+
 
 class DiskPropertyStore:
     """Tiered Disk-Backed Property Store using SQLite WAL mode and in-memory LRU Cache.
@@ -190,6 +202,7 @@ class DiskPropertyStore:
 
     def __init__(self, db_path: str, lru_cache_size: int = 100000):
         self._lock = threading.RLock()
+        self._local = threading.local()
         self.db_path = db_path
         self.lru_cache_size = lru_cache_size
         self._node_lru: OrderedDict[int, Dict[str, Any]] = OrderedDict()
@@ -232,9 +245,14 @@ class DiskPropertyStore:
         conn.close()
 
     def _get_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.execute("PRAGMA mmap_size = 2147483648;")
-        conn.execute("PRAGMA cache_size = -262144;")
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.execute("PRAGMA journal_mode = WAL;")
+            conn.execute("PRAGMA synchronous = NORMAL;")
+            conn.execute("PRAGMA mmap_size = 2147483648;")
+            conn.execute("PRAGMA cache_size = -262144;")
+            self._local.conn = conn
         return conn
 
     def set_node_properties(self, node_id: int, properties: Dict[str, Any]) -> None:
@@ -257,13 +275,15 @@ class DiskPropertyStore:
                     (node_id, json.dumps(current)),
                 )
                 for k, v in properties.items():
+                    conn.execute("DELETE FROM property_index WHERE prop_key = ? AND node_id = ?", (k, node_id))
                     conn.execute(
-                        "INSERT OR IGNORE INTO property_index (prop_key, prop_val, node_id) VALUES (?, ?, ?)",
+                        "INSERT INTO property_index (prop_key, prop_val, node_id) VALUES (?, ?, ?)",
                         (k, str(v), node_id),
                     )
                 conn.commit()
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def set_nodes_properties_batch(self, batch_props: Dict[int, Dict[str, Any]]) -> None:
         """Batch insert/update properties for multiple nodes in a single atomic transaction."""
@@ -293,12 +313,17 @@ class DiskPropertyStore:
                 )
                 if idx_rows:
                     conn.executemany(
-                        "INSERT OR IGNORE INTO property_index (prop_key, prop_val, node_id) VALUES (?, ?, ?)",
+                        "DELETE FROM property_index WHERE prop_key = ? AND node_id = ?",
+                        [(k, node_id) for k, _, node_id in idx_rows],
+                    )
+                    conn.executemany(
+                        "INSERT INTO property_index (prop_key, prop_val, node_id) VALUES (?, ?, ?)",
                         idx_rows,
                     )
                 conn.commit()
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def set_edges_properties_batch(self, batch_edges: List[Tuple[int, str, int, Dict[str, Any]]]) -> None:
         """Batch insert/update properties for multiple edges in a single atomic transaction."""
@@ -324,8 +349,9 @@ class DiskPropertyStore:
                     edge_rows,
                 )
                 conn.commit()
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_node_properties(self, node_id: int) -> Dict[str, Any]:
         """Retrieve properties for a node, returning cached dict reference directly without allocating a new dict()."""
@@ -345,8 +371,9 @@ class DiskPropertyStore:
                         self._node_lru.popitem(last=False)
                     return props
                 return {}
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def batch_get_nodes_properties(self, node_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Fetches properties for a list of node IDs.
@@ -388,8 +415,10 @@ class DiskPropertyStore:
                         for nid in chunk:
                             if nid not in found:
                                 result[nid] = {}
-                finally:
-                    conn.close()
+
+                except Exception:
+                    conn.rollback()
+                    raise
 
             return {nid: result.get(nid, {}) for nid in node_ids}
 
@@ -441,8 +470,9 @@ class DiskPropertyStore:
                 conn.execute("DELETE FROM node_properties WHERE node_id = ?", (node_id,))
                 conn.execute("DELETE FROM property_index WHERE node_id = ?", (node_id,))
                 conn.commit()
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def set_edge_properties(self, src: int, rel_type: str, dst: int, properties: Dict[str, Any]) -> None:
         with self._lock:
@@ -463,8 +493,24 @@ class DiskPropertyStore:
                     (src, rel_type, dst, json.dumps(current)),
                 )
                 conn.commit()
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def delete_edge_properties(self, src: int, rel_type: str, dst: int) -> None:
+        with self._lock:
+            key = (src, rel_type, dst)
+            self._edge_lru.pop(key, None)
+            conn = self._get_conn()
+            try:
+                conn.execute(
+                    "DELETE FROM edge_properties WHERE src = ? AND rel_type = ? AND dst = ?",
+                    key,
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_edge_properties(self, src: int, rel_type: str, dst: int) -> Dict[str, Any]:
         with self._lock:
@@ -487,8 +533,9 @@ class DiskPropertyStore:
                         self._edge_lru.popitem(last=False)
                     return props
                 return {}
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def create_node_property_index(self, property_name: str) -> None:
         pass
@@ -500,8 +547,9 @@ class DiskPropertyStore:
                 conn.execute("DELETE FROM property_index WHERE prop_key = ?", (property_name,))
                 conn.commit()
                 return True
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
 
     def get_indexed_properties(self) -> List[str]:
         with self._lock:
@@ -509,8 +557,31 @@ class DiskPropertyStore:
             try:
                 cursor = conn.execute("SELECT DISTINCT prop_key FROM property_index")
                 return sorted([r[0] for r in cursor.fetchall()])
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def close(self) -> None:
+        """Close the calling thread's persistent SQLite connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
+    def clear(self) -> None:
+        """Remove all persisted values and cached properties."""
+        with self._lock:
+            conn = self._get_conn()
+            try:
+                conn.execute("DELETE FROM node_properties")
+                conn.execute("DELETE FROM edge_properties")
+                conn.execute("DELETE FROM property_index")
+                conn.commit()
+                self._node_lru.clear()
+                self._edge_lru.clear()
+            except Exception:
+                conn.rollback()
+                raise
 
     def find_nodes_by_property(self, property_name: str, value: Any) -> Set[int]:
         with self._lock:
@@ -521,5 +592,6 @@ class DiskPropertyStore:
                     (property_name, str(value)),
                 )
                 return {row[0] for row in cursor.fetchall()}
-            finally:
-                conn.close()
+            except Exception:
+                conn.rollback()
+                raise

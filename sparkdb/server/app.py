@@ -65,6 +65,23 @@ class SparkDBRequestHandler(BaseHTTPRequestHandler):
         """Backwards-compatible alias for sending response with format negotiation."""
         self._send_payload(status, payload)
 
+    def _authorize(self, admin: bool = False) -> bool:
+        """Authorize requests using configured admin and optional read-only bearer tokens."""
+        admin_token = os.getenv("SPARKDB_AUTH_TOKEN")
+        readonly_token = os.getenv("SPARKDB_READONLY_TOKEN")
+        if not admin_token and not readonly_token:
+            self._send_payload(503, {"error": "Server authentication is not configured"})
+            return False
+
+        header = self.headers.get("Authorization", "")
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        if admin_token and supplied == admin_token:
+            return True
+        if not admin and readonly_token and supplied == readonly_token:
+            return True
+        self._send_payload(403 if supplied else 401, {"error": "Invalid or missing bearer token"})
+        return False
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/health":
@@ -80,6 +97,9 @@ class SparkDBRequestHandler(BaseHTTPRequestHandler):
                 "active_projects": projects,
                 "active_graphs": projects,
             })
+            return
+
+        if not self._authorize(admin=False):
             return
 
         if parsed.path in ("/graphs", "/projects"):
@@ -98,18 +118,55 @@ class SparkDBRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", 0))
-        raw_body = self.rfile.read(length)
-        content_type = self.headers.get("Content-Type", "")
-        try:
-            if "application/msgpack" in content_type and HAS_MSGPACK:
-                payload = msgpack.unpackb(raw_body, raw=False) if raw_body else {}
-            else:
-                raw_text = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else raw_body
-                payload = json.loads(raw_text) if raw_text else {}
-        except Exception as e:
-            self._send_payload(400, {"error": f"Invalid payload: {e}"})
+        if parsed.path not in ("/query", "/query_batch", "/checkpoint", "/drop", "/drop_all"):
+            self._send_payload(404, {"error": "Endpoint not found"})
             return
+
+        raw_auth = self.headers.get("Authorization", "")
+        supplied = raw_auth[7:].strip() if raw_auth.lower().startswith("bearer ") else ""
+        query_is_readonly = parsed.path in ("/query", "/query_batch")
+        if query_is_readonly:
+            # Read-only tokens may execute only non-mutating queries.
+            body_length = int(self.headers.get("Content-Length", 0))
+            raw_body = self.rfile.read(body_length)
+            content_type = self.headers.get("Content-Type", "")
+            try:
+                if "application/msgpack" in content_type and HAS_MSGPACK:
+                    auth_payload = msgpack.unpackb(raw_body, raw=False) if raw_body else {}
+                else:
+                    auth_payload = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+            except Exception as e:
+                self._send_payload(400, {"error": f"Invalid payload: {e}"})
+                return
+            query_text = auth_payload.get("query", "") if parsed.path == "/query" else json.dumps(auth_payload.get("queries", []))
+            mutation = re.search(r"\b(CREATE|DELETE|SET|REMOVE|MERGE|DROP)\b", query_text, re.IGNORECASE)
+            if mutation and os.getenv("SPARKDB_AUTH_TOKEN") != supplied:
+                self._send_payload(403, {"error": "An admin bearer token is required for mutations"})
+                return
+            # Reuse the decoded request below without reading the body twice.
+            payload = auth_payload
+        else:
+            if not self._authorize(admin=True):
+                return
+            payload = None
+
+        if query_is_readonly:
+            if not self._authorize(admin=False):
+                return
+        # For admin requests, authorization was checked above. Read the body now.
+        length = int(self.headers.get("Content-Length", 0))
+        raw_body = b"" if query_is_readonly else self.rfile.read(length)
+        content_type = self.headers.get("Content-Type", "")
+        if not query_is_readonly:
+            try:
+                if "application/msgpack" in content_type and HAS_MSGPACK:
+                    payload = msgpack.unpackb(raw_body, raw=False) if raw_body else {}
+                else:
+                    raw_text = raw_body.decode("utf-8") if isinstance(raw_body, bytes) else raw_body
+                    payload = json.loads(raw_text) if raw_text else {}
+            except Exception as e:
+                self._send_payload(400, {"error": f"Invalid payload: {e}"})
+                return
 
         if parsed.path == "/query":
             graph_name = payload.get("project") or payload.get("graph", "default")

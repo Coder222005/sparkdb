@@ -12,7 +12,7 @@ import shutil
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,47 @@ class PersistenceEngine:
                     f.truncate(0)
 
             logger.info(f"Saved snapshot for graph '{self.graph_name}' to {self.snapshot_file}")
+            return self.snapshot_file
+
+    def save_snapshot_stream(
+        self,
+        graph_name: str,
+        node_count: int,
+        nodes: Iterable[Dict[str, Any]],
+        edges: Iterable[Dict[str, Any]],
+    ) -> str:
+        """Write the snapshot format incrementally to bound peak memory."""
+        with self._lock:
+            if self._aof_handle and not self._aof_handle.closed:
+                self._aof_handle.close()
+                self._aof_handle = None
+
+            temp_fd, temp_path = tempfile.mkstemp(dir=self.graph_dir, prefix="snap_", suffix=".tmp")
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
+                handle.write(
+                    '{"graph_name":' + json.dumps(graph_name) +
+                    ',"node_count":' + str(node_count) + ',"nodes":['
+                )
+                first = True
+                for node in nodes:
+                    if not first:
+                        handle.write(",")
+                    json.dump(node, handle, default=str)
+                    first = False
+                handle.write("],\"edges\":[")
+                first = True
+                for edge in edges:
+                    if not first:
+                        handle.write(",")
+                    json.dump(edge, handle, default=str)
+                    first = False
+                handle.write("]}")
+
+            shutil.move(temp_path, self.snapshot_file)
+            if os.path.exists(self.aof_file):
+                with open(self.aof_file, "w") as handle:
+                    handle.truncate(0)
+            logger.info(f"Saved streamed snapshot for graph '{self.graph_name}' to {self.snapshot_file}")
             return self.snapshot_file
 
     def load_snapshot(self) -> Optional[Dict[str, Any]]:
