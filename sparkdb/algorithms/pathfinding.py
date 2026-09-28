@@ -15,6 +15,8 @@ import numpy as np
 import scipy.sparse as sp
 
 logger = logging.getLogger(__name__)
+MAX_PATH_HOPS = 6
+DEFAULT_MAX_PATHS = 100000
 
 
 def multi_hop_paths(
@@ -23,10 +25,15 @@ def multi_hop_paths(
     rel_path: List[str],
     target_label: Optional[str] = None,
     max_paths: Optional[int] = None,
+    max_hops: int = MAX_PATH_HOPS,
 ) -> List[List[int]]:
     """Compute all directed paths following a relation chain with optional early limit exit."""
     if not rel_path:
         return [[nid] for nid in (start_node_ids[:max_paths] if max_paths else start_node_ids)]
+
+    if len(rel_path) > max_hops:
+        raise ValueError(f"Path traversal exceeds the maximum of {max_hops} hops")
+    path_budget = DEFAULT_MAX_PATHS if max_paths is None else max_paths
 
     current_paths = [[nid] for nid in start_node_ids]
 
@@ -43,10 +50,12 @@ def multi_hop_paths(
             r_start = csr.indptr[curr]
             r_end = csr.indptr[curr + 1]
             for nbr in csr.indices[r_start:r_end]:
+                if max_paths is None and len(next_paths) >= path_budget:
+                    raise ValueError(f"Path expansion exceeds the maximum of {path_budget} paths")
                 next_paths.append(path + [int(nbr)])
-                if max_paths and len(next_paths) >= max_paths:
+                if len(next_paths) >= path_budget:
                     break
-            if max_paths and len(next_paths) >= max_paths:
+            if max_paths is not None and len(next_paths) >= path_budget:
                 break
 
         current_paths = next_paths
@@ -60,10 +69,7 @@ def multi_hop_paths(
             valid_targets = matrix_store.get_nodes_with_label(target_label)
             current_paths = [p for p in current_paths if p[-1] in valid_targets]
 
-    if max_paths:
-        return current_paths[:max_paths]
-
-    return current_paths
+    return current_paths[:path_budget]
 
 
 def shortest_path(

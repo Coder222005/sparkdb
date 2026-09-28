@@ -30,8 +30,7 @@ def substitute_params(query: str, params: Optional[Dict[str, Any]] = None) -> st
     q = query
     for key, val in params.items():
         if isinstance(val, str):
-            escaped = val.replace("'", "\\'")
-            rep = f"'{escaped}'"
+            rep = json.dumps(val)
         elif isinstance(val, bool):
             rep = "true" if val else "false"
         elif val is None:

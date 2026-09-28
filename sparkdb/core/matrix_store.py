@@ -34,16 +34,18 @@ class MatrixStore:
         # High-performance edge storage: rel_type -> {(src, dst): weight}
         self._rel_matrices: Dict[str, Dict[Tuple[int, int], float]] = {}
         self._csr_cache: Dict[str, sp.csr_matrix] = {}
-        self._csc_cache: Dict[str, sp.csc_matrix] = {}
         self._dirty_matrices: Set[str] = set()
-        self._rev_csr_cache: Dict[str, sp.csr_matrix] = {}
-        self._unified_csr: Optional[sp.csr_matrix] = None
-        self._unified_dirty: bool = True
 
-    def add_node(self, labels: Optional[List[str]] = None) -> int:
+    def add_node(self, labels: Optional[List[str]] = None, node_id: Optional[int] = None) -> int:
         """Allocate a node ID (recycles deleted IDs if available) and assign labels."""
         with self._lock:
-            if self._free_node_ids:
+            if node_id is not None:
+                if node_id < 0 or node_id in self._active_nodes:
+                    raise ValueError(f"Invalid or already active node ID {node_id}")
+                self._free_node_ids = [free_id for free_id in self._free_node_ids if free_id != node_id]
+                self.node_count = max(self.node_count, node_id + 1)
+                self.node_capacity = max(self.node_capacity, self.node_count)
+            elif self._free_node_ids:
                 node_id = self._free_node_ids.pop()
             else:
                 node_id = self.node_count
@@ -54,12 +56,19 @@ class MatrixStore:
             self._active_nodes.add(node_id)
             self.node_to_labels[node_id] = set()
             self._dirty_matrices.update(self._rel_matrices.keys())
-            self._unified_dirty = True
             if labels:
                 for lbl in labels:
                     self.add_node_label(node_id, lbl)
 
             return node_id
+
+    def rebuild_free_node_ids(self) -> None:
+        """Reconstruct reusable IDs after loading a snapshot with sparse node IDs."""
+        with self._lock:
+            self._free_node_ids = [
+                node_id for node_id in range(self.node_count)
+                if node_id not in self._active_nodes
+            ]
 
     def delete_node(self, node_id: int) -> bool:
         """Mark a node as deleted, clear its edges, and add to free-list."""
@@ -83,7 +92,6 @@ class MatrixStore:
                     del mat[k]
                 if keys_to_delete:
                     self._dirty_matrices.add(rel)
-                    self._unified_dirty = True
 
             return True
 
@@ -116,7 +124,6 @@ class MatrixStore:
 
             self._rel_matrices[rel_type][(src, dst)] = float(weight)
             self._dirty_matrices.add(rel_type)
-            self._unified_dirty = True
 
     def delete_edge(self, src: int, rel_type: str, dst: int) -> bool:
         """Remove a directed edge."""
@@ -124,7 +131,6 @@ class MatrixStore:
             if rel_type in self._rel_matrices and (src, dst) in self._rel_matrices[rel_type]:
                 del self._rel_matrices[rel_type][(src, dst)]
                 self._dirty_matrices.add(rel_type)
-                self._unified_dirty = True
                 return True
             return False
 
@@ -148,38 +154,27 @@ class MatrixStore:
             return self._csr_cache[rel_type]
 
     def get_csc(self, rel_type: str) -> sp.csc_matrix:
-        """Retrieve cached Compressed Sparse Column matrix for reverse traversals."""
+        """Build a transient CSC view from the primary CSR representation."""
         with self._lock:
             if rel_type not in self._rel_matrices:
                 return sp.csr_matrix((self.node_count, self.node_count), dtype=np.float32).tocsc()
 
-            if rel_type not in self._csc_cache or rel_type in self._dirty_matrices:
-                csr = self.get_csr(rel_type)
-                self._csc_cache[rel_type] = csr.tocsc()
-
-            return self._csc_cache[rel_type]
+            return self.get_csr(rel_type).tocsc()
 
     def get_reverse_adjacency(self, rel_type: str) -> sp.csr_matrix:
-        """Retrieve cached or compiled reverse (transposed) adjacency matrix for backward traversals."""
+        """Build a transient reverse adjacency view from the primary CSR."""
         with self._lock:
             if rel_type not in self._rel_matrices:
                 return sp.csr_matrix((self.node_count, self.node_count), dtype=np.float32)
 
-            if rel_type not in self._rev_csr_cache or rel_type in self._dirty_matrices:
-                csr = self.get_csr(rel_type)
-                self._rev_csr_cache[rel_type] = csr.transpose().tocsr()
-
-            return self._rev_csr_cache[rel_type]
+            return self.get_csr(rel_type).transpose().tocsr()
 
     def get_unified_csr(self) -> sp.csr_matrix:
-        """Retrieve or build the combined adjacency CSR across all relationship types."""
+        """Build a transient combined adjacency CSR across relationship types."""
         with self._lock:
-            if self._unified_csr is not None and not self._unified_dirty:
-                return self._unified_csr
-
             total_edges = sum(len(m) for m in self._rel_matrices.values())
             if total_edges == 0:
-                self._unified_csr = sp.csr_matrix((self.node_count, self.node_count), dtype=np.float32)
+                return sp.csr_matrix((self.node_count, self.node_count), dtype=np.float32)
             else:
                 rows = np.empty(total_edges, dtype=np.int32)
                 cols = np.empty(total_edges, dtype=np.int32)
@@ -193,9 +188,7 @@ class MatrixStore:
                     cols[offset:offset + m_len] = [k[1] for k in mat.keys()]
                     vals[offset:offset + m_len] = list(mat.values())
                     offset += m_len
-                self._unified_csr = sp.csr_matrix((vals, (rows, cols)), shape=(self.node_count, self.node_count))
-            self._unified_dirty = False
-            return self._unified_csr
+                return sp.csr_matrix((vals, (rows, cols)), shape=(self.node_count, self.node_count))
 
     def traverse_boolean_step(self, frontier: np.ndarray, rel_type: str) -> np.ndarray:
         """Compute single-hop reachability over Boolean semiring via vector-matrix dot product."""
