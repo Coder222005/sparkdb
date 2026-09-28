@@ -115,3 +115,28 @@ def test_sparkdb_hybrid_persistence(temp_hybrid_dir):
     assert len(res.result_set) == 1
     assert res.result_set[0] == ["gNodeB", 12]
 
+
+def test_sparkdb_hybrid_batched_property_search(temp_hybrid_dir):
+    """Verifies that large multi-hop searches correctly pre-fetch properties in batch."""
+    db = SparkDB(storage_dir=temp_hybrid_dir)
+    g = db.select_graph("batch_search_test", storage_mode="hybrid", lru_cache_size=5)
+
+    # Ingest a chain of 25 nodes with properties
+    create_queries = []
+    for i in range(25):
+        create_queries.append(f"(n{i}:Item {{id: {i}, name: 'Item_{i}', category: 'Cat_{i % 3}'}})")
+    edges = [f"(n{i})-[:NEXT]->(n{i+1})" for i in range(24)]
+    g.query(f"CREATE {', '.join(create_queries + edges)}")
+
+    # Evict LRU cache by setting a tiny cache size of 5
+    assert len(g._space.property_store._node_lru) <= 5
+
+    # Run a multi-hop traversal matching paths across 2 hops
+    res = g.query("MATCH (a:Item)-[:NEXT]->(b:Item)-[:NEXT]->(c:Item) WHERE a.category = 'Cat_0' RETURN a.name, b.name, c.name")
+    assert len(res.result_set) > 0
+    for row in res.result_set:
+        assert row[0].startswith("Item_")
+        assert row[1].startswith("Item_")
+        assert row[2].startswith("Item_")
+
+

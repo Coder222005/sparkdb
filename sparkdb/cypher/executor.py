@@ -353,8 +353,14 @@ class CypherExecutor:
 
             header = ["node", "score"]
             rows = []
+            matched_nids = [nid for nid, _ in matches]
+            batch_props = (
+                self.graph.property_store.batch_get_nodes_properties(matched_nids)
+                if matched_nids and hasattr(self.graph.property_store, "batch_get_nodes_properties")
+                else {}
+            )
             for nid, dist in matches:
-                p = self.graph.property_store.get_node_properties(nid)
+                p = dict(batch_props.get(nid, self.graph.property_store.get_node_properties(nid)))
                 p["_id"] = nid
                 p["_labels"] = list(self.graph.matrix_store.node_to_labels.get(nid, set()))
                 rows.append([p, dist])
@@ -366,8 +372,14 @@ class CypherExecutor:
             matches = self.graph.fulltext_store.search(q_text, top_k=top_k)
             header = ["node", "score"]
             rows = []
+            matched_nids = [nid for nid, _ in matches]
+            batch_props = (
+                self.graph.property_store.batch_get_nodes_properties(matched_nids)
+                if matched_nids and hasattr(self.graph.property_store, "batch_get_nodes_properties")
+                else {}
+            )
             for nid, score in matches:
-                p = self.graph.property_store.get_node_properties(nid)
+                p = dict(batch_props.get(nid, self.graph.property_store.get_node_properties(nid)))
                 p["_id"] = nid
                 rows.append([p, score])
             return QueryResult(header=header, result_set=rows)
@@ -479,6 +491,17 @@ class CypherExecutor:
                 max_paths=fetch_limit,
             )
 
+        # Vectorized pre-fetch all node properties across candidate paths in ONE batch
+        all_nids: Set[int] = set()
+        for p in paths:
+            all_nids.update(p)
+
+        props_cache: Dict[int, Dict[str, Any]] = (
+            self.graph.property_store.batch_get_nodes_properties(list(all_nids))
+            if all_nids and hasattr(self.graph.property_store, "batch_get_nodes_properties")
+            else {}
+        )
+
         valid_paths = []
         for p in paths:
             match = True
@@ -486,13 +509,13 @@ class CypherExecutor:
                 if i < len(nodes):
                     expected_props = nodes[i].get("properties", {})
                     if expected_props:
-                        node_props = self.graph.property_store.get_node_properties(nid)
+                        node_props = props_cache.get(nid) if nid in props_cache else self.graph.property_store.get_node_properties(nid)
                         if not all(node_props.get(k) == v for k, v in expected_props.items()):
                             match = False
                             break
             if match:
                 if where_clause:
-                    var_map = self._build_var_map(p, nodes, rels, rel_info)
+                    var_map = self._build_var_map(p, nodes, rels, rel_info, props_cache=props_cache)
                     if not self._evaluate_where(where_clause, var_map):
                         continue
                 valid_paths.append(p)
@@ -590,11 +613,11 @@ class CypherExecutor:
         has_aggregation = any(bool(agg_pattern.match(expr.strip())) for expr, _ in projections)
 
         if has_aggregation:
-            rows = self._compute_aggregations(projections, valid_paths, nodes, rels, rel_info)
+            rows = self._compute_aggregations(projections, valid_paths, nodes, rels, rel_info, props_cache=props_cache)
         else:
             rows = []
             for p in valid_paths:
-                var_to_node = self._build_var_map(p, nodes, rels, rel_info)
+                var_to_node = self._build_var_map(p, nodes, rels, rel_info, props_cache=props_cache)
                 row = []
                 for expr, alias in projections:
                     val = self._resolve_projection_value(expr, var_to_node, p)
@@ -702,14 +725,22 @@ class CypherExecutor:
 
         return paths
 
-    def _build_var_map(self, path: List[int], nodes: List[Dict[str, Any]], rels: List[str], rel_info: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _build_var_map(
+        self,
+        path: List[int],
+        nodes: List[Dict[str, Any]],
+        rels: List[str],
+        rel_info: List[Dict[str, Any]],
+        props_cache: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
         var_to_node: Dict[str, Dict[str, Any]] = {}
         for i, nid in enumerate(path):
             if i < len(nodes) and nodes[i].get("var"):
+                node_props = props_cache.get(nid) if (props_cache is not None and nid in props_cache) else self.graph.property_store.get_node_properties(nid)
                 var_to_node[nodes[i]["var"]] = {
                     "_id": nid,
                     "_labels": list(self.graph.matrix_store.node_to_labels.get(nid, set())),
-                    **self.graph.property_store.get_node_properties(nid),
+                    **node_props,
                 }
 
         for i, r_meta in enumerate(rel_info):
@@ -836,6 +867,7 @@ class CypherExecutor:
         nodes: List[Dict[str, Any]],
         rels: List[str],
         rel_info: List[Dict[str, Any]],
+        props_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> List[List[Any]]:
         agg_pattern = re.compile(r"^(count|sum|avg|min|max|collect)\s*\((.*?)\)$", re.IGNORECASE)
 
@@ -848,14 +880,14 @@ class CypherExecutor:
                 if m:
                     fn = m.group(1).lower()
                     arg = m.group(2).strip()
-                    row.append(self._eval_aggregate_fn(fn, arg, valid_paths, nodes, rels, rel_info))
+                    row.append(self._eval_aggregate_fn(fn, arg, valid_paths, nodes, rels, rel_info, props_cache=props_cache))
                 else:
                     row.append(None)
             return [row]
 
         groups: Dict[Tuple[Any, ...], List[List[int]]] = {}
         for p in valid_paths:
-            vmap = self._build_var_map(p, nodes, rels, rel_info)
+            vmap = self._build_var_map(p, nodes, rels, rel_info, props_cache=props_cache)
             gkey = tuple(self._resolve_projection_value(projections[i][0], vmap, p) for i in group_keys)
             if gkey not in groups:
                 groups[gkey] = []
@@ -870,7 +902,7 @@ class CypherExecutor:
                 if m:
                     fn = m.group(1).lower()
                     arg = m.group(2).strip()
-                    row.append(self._eval_aggregate_fn(fn, arg, group_paths, nodes, rels, rel_info))
+                    row.append(self._eval_aggregate_fn(fn, arg, group_paths, nodes, rels, rel_info, props_cache=props_cache))
                 else:
                     row.append(gkey[g_idx])
                     g_idx += 1
@@ -886,13 +918,14 @@ class CypherExecutor:
         nodes: List[Dict[str, Any]],
         rels: List[str],
         rel_info: List[Dict[str, Any]],
+        props_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> Any:
         if fn == "count":
             if arg in ("*", ""):
                 return len(paths)
             count = 0
             for p in paths:
-                vmap = self._build_var_map(p, nodes, rels, rel_info)
+                vmap = self._build_var_map(p, nodes, rels, rel_info, props_cache=props_cache)
                 val = self._resolve_projection_value(arg, vmap, p)
                 if val is not None:
                     count += 1
@@ -915,7 +948,7 @@ class CypherExecutor:
 
         vals = []
         for p in paths:
-            vmap = self._build_var_map(p, nodes, rels, rel_info)
+            vmap = self._build_var_map(p, nodes, rels, rel_info, props_cache=props_cache)
             v = self._resolve_projection_value(arg, vmap, p)
             if v is not None:
                 vals.append(v)

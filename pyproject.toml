@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sparkdb"
-version = "1.1.0"
+version = "1.1.1"
 description = "Fast GraphBLAS Sparse Linear Algebra Graph Database (Clean-Room / Zero-SSPL)"
 authors = [
     { name = "Bommireddy Venkata Dheeraj Reddy", email = "bommireddyvenkatadheerajreddy@gmail.com" },

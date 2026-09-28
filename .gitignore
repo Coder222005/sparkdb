@@ -19,13 +19,23 @@ venv/
 ENV/
 env/
 
-# Database and Storage Test Data
+# Database and Storage Files
 data/
 *.db
 *.db-wal
 *.db-shm
 *.aof
 *.snapshot.json
+snapshot.json
+mutations.aof
+properties.db
+*.tmp
+temp_*/
+sparkdb_test_*/
+
+# Logs and Debugging
+*.log
+logs/
 
 # IDE and Editor Files
 .vscode/

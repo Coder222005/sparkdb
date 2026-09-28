@@ -72,7 +72,7 @@ class SparkDBRequestHandler(BaseHTTPRequestHandler):
                 host_ip = "127.0.0.1"
             self._send_payload(200, {
                 "status": "healthy",
-                "engine": "SparkDB v1.1.0 (BSD 3-Clause)",
+                "engine": "SparkDB v1.1.1 (BSD 3-Clause)",
                 "host_ip": host_ip,
                 "port": getattr(self.server, "server_port", 7379),
                 "active_projects": projects,
