@@ -16,9 +16,11 @@ Provides a drop-in replacement for the FalkorDB Python SDK (`falkordb`):
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 import urllib.error
 import urllib.request
@@ -52,6 +54,45 @@ class GraphClient:
     def query(self, cypher: str, params: Optional[Dict[str, Any]] = None) -> QueryResult:
         """Execute a read-write Cypher query."""
         return self._executor.execute(cypher, params=params)
+
+    def query_batch(
+        self,
+        queries: List[Any],
+        parallel: bool = True,
+        max_workers: int = 8,
+    ) -> List[QueryResult]:
+        """Execute a batch of Cypher queries with optional thread parallelism.
+
+        Args:
+            queries: List of query strings or dicts with {"query": str, "params": dict}
+            parallel: Whether read-only queries should execute in parallel across worker threads
+            max_workers: Maximum worker threads (default 8)
+
+        Returns:
+            List of QueryResult objects corresponding to each query in the batch.
+        """
+        if not queries:
+            return []
+
+        def _run_one(q_item: Any) -> QueryResult:
+            if isinstance(q_item, str):
+                return self._executor.execute(q_item)
+            elif isinstance(q_item, dict):
+                return self._executor.execute(q_item.get("query", ""), params=q_item.get("params"))
+            raise ValueError("Query item must be a string or dict with 'query'")
+
+        mutation_keywords = re.compile(r"\b(CREATE|DELETE|SET|REMOVE|MERGE|DROP)\b", re.IGNORECASE)
+        has_mutations = any(
+            mutation_keywords.search(q if isinstance(q, str) else q.get("query", ""))
+            for q in queries
+        )
+
+        if parallel and not has_mutations and len(queries) > 1:
+            workers = min(max_workers, len(queries))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                return list(pool.map(_run_one, queries))
+        else:
+            return [_run_one(q) for q in queries]
 
     def ro_query(self, cypher: str, params: Optional[Dict[str, Any]] = None) -> QueryResult:
         """Execute a read-only Cypher query."""

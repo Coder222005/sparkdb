@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * Optimized `CALL db.idx.vector.querynodes()` and `CALL db.idx.fulltext.querynodes()`.
   * Pre-fetches properties for all top-$K$ matched nodes in a single batch, avoiding iterative property retrieval.
 
+* **Server-Side Parallel Batch Endpoint (`POST /query_batch`) & Client `query_batch()`**:
+  * Allows sending multiple queries in a single HTTP request, eliminating $N-1$ TCP handshakes and network round-trips.
+  * **Server-side Multi-threaded Parallelism**: Read-only queries automatically execute in parallel across a configurable `ThreadPoolExecutor(max_workers=...)`, while mutations run sequentially to preserve ACID consistency.
+  * **Cold Project Pre-Warming (Race Condition Edge Case)**: All target graph spaces are warmed up on the parent server thread prior to dispatching to the pool, guaranteeing worker threads access the warm in-memory GraphSpace directly without disk re-initialization or concurrent loading lag.
+  * Added `graph.query_batch()` to both `RemoteGraphClient` and embedded `GraphClient`.
+
 * **Automated CI/CD & GitHub Releases**:
   * Added automated GitHub Actions workflow (`.github/workflows/release.yml`) for building wheels (`.whl`), source distributions (`.tar.gz`), running tests, and publishing GitHub Release assets on version tags.
 

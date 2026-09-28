@@ -7,13 +7,15 @@ Supports compact binary MessagePack protocol with transparent JSON fallback.
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import os
+import re
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -133,6 +135,106 @@ class SparkDBRequestHandler(BaseHTTPRequestHandler):
                     "properties_set": res.properties_set,
                     "indices_created": res.indices_created,
                     "indices_deleted": res.indices_deleted,
+                })
+            except Exception as e:
+                self._send_payload(500, {"error": str(e)})
+            return
+
+        if parsed.path == "/query_batch":
+            default_graph = payload.get("project") or payload.get("graph", "default")
+            queries = payload.get("queries", [])
+            if not isinstance(queries, list) or not queries:
+                self._send_payload(400, {"error": "Missing or empty 'queries' list in payload"})
+                return
+
+            parallel_requested = payload.get("parallel", True)
+            try:
+                max_workers = max(1, min(int(payload.get("max_workers", 8)), 32))
+            except (ValueError, TypeError):
+                max_workers = 8
+
+            t_batch_start = time.perf_counter()
+            try:
+                # CRITICAL EDGE CASE: Warm up / load all referenced project(s) ONCE on the parent thread.
+                # If a project is cold on disk, this pre-loads snapshot.json, replays AOF, and opens SQLite
+                # before pool workers launch. Worker threads then read the warm in-memory GraphSpace directly
+                # with zero cold-start delay or concurrent initialization race conditions.
+                referenced_projects: Set[str] = set()
+                for q in queries:
+                    if isinstance(q, dict):
+                        p_name = q.get("project") or q.get("graph") or default_graph
+                        referenced_projects.add(str(p_name))
+                    else:
+                        referenced_projects.add(default_graph)
+
+                graph_map: Dict[str, Any] = {
+                    p_name: self.db.select_graph(p_name)
+                    for p_name in referenced_projects
+                }
+
+                from sparkdb.cypher.executor import CypherExecutor
+
+                def _run_single_query(q_item: Any) -> Dict[str, Any]:
+                    if isinstance(q_item, str):
+                        q_str = q_item
+                        q_params = None
+                        target_g = graph_map[default_graph]
+                    elif isinstance(q_item, dict):
+                        q_str = q_item.get("query", "")
+                        q_params = q_item.get("params")
+                        p_name = q_item.get("project") or q_item.get("graph") or default_graph
+                        target_g = graph_map.get(str(p_name), graph_map[default_graph])
+                    else:
+                        return {"success": False, "error": "Query item must be a string or object with 'query'"}
+
+                    if not q_str:
+                        return {"success": False, "error": "Empty query string"}
+
+                    try:
+                        executor = CypherExecutor(target_g)
+                        res = executor.execute(q_str, params=q_params)
+                        return {
+                            "success": True,
+                            "header": res.header,
+                            "result_set": res.result_set,
+                            "execution_time_ms": res.execution_time_ms,
+                            "nodes_created": res.nodes_created,
+                            "relationships_created": res.relationships_created,
+                            "nodes_deleted": res.nodes_deleted,
+                            "relationships_deleted": res.relationships_deleted,
+                            "properties_set": res.properties_set,
+                            "indices_created": res.indices_created,
+                            "indices_deleted": res.indices_deleted,
+                        }
+                    except Exception as ex:
+                        return {"success": False, "error": str(ex)}
+
+                # Mutation detection:
+                # If any query contains mutations (CREATE, SET, DELETE, MERGE, DROP),
+                # running in parallel could cause race conditions on topology matrices.
+                # In that case, we safely execute them sequentially to preserve consistency.
+                mutation_keywords = re.compile(r"\b(CREATE|DELETE|SET|REMOVE|MERGE|DROP)\b", re.IGNORECASE)
+                has_mutations = any(
+                    mutation_keywords.search(q if isinstance(q, str) else q.get("query", ""))
+                    for q in queries
+                )
+
+                should_parallel = parallel_requested and (not has_mutations) and (len(queries) > 1)
+
+                if should_parallel:
+                    workers = min(max_workers, len(queries))
+                    with ThreadPoolExecutor(max_workers=workers) as pool:
+                        results = list(pool.map(_run_single_query, queries))
+                else:
+                    results = [_run_single_query(q) for q in queries]
+
+                total_time_ms = (time.perf_counter() - t_batch_start) * 1000.0
+                self._send_payload(200, {
+                    "total_queries": len(queries),
+                    "parallel": should_parallel,
+                    "max_workers": max_workers if should_parallel else 1,
+                    "total_execution_time_ms": round(total_time_ms, 3),
+                    "results": results,
                 })
             except Exception as e:
                 self._send_payload(500, {"error": str(e)})

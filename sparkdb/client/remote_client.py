@@ -100,6 +100,50 @@ class RemoteGraphClient:
             indices_deleted=res.get("indices_deleted", 0),
         )
 
+    def query_batch(
+        self,
+        queries: List[Any],
+        parallel: bool = True,
+        max_workers: int = 8,
+    ) -> List[QueryResult]:
+        """Execute a batch of Cypher queries in a single HTTP request with server-side parallelism.
+
+        Args:
+            queries: List of query strings or dicts with {"query": str, "params": dict, optional "project": str}
+            parallel: Whether read-only queries should execute in parallel on the server (default: True)
+            max_workers: Maximum worker threads on the server (default: 8)
+
+        Returns:
+            List of QueryResult objects corresponding to each query in the batch.
+        """
+        payload = {
+            "project": self.project,
+            "graph": self.name,
+            "queries": queries,
+            "parallel": parallel,
+            "max_workers": max_workers,
+        }
+        res = self._post("/query_batch", payload)
+        results = []
+        for r in res.get("results", []):
+            if not r.get("success", True) and "error" in r:
+                raise RuntimeError(f"Batch query error: {r['error']}")
+            results.append(
+                QueryResult(
+                    header=r.get("header", []),
+                    result_set=r.get("result_set", []),
+                    execution_time_ms=r.get("execution_time_ms", 0.0),
+                    nodes_created=r.get("nodes_created", 0),
+                    relationships_created=r.get("relationships_created", 0),
+                    nodes_deleted=r.get("nodes_deleted", 0),
+                    relationships_deleted=r.get("relationships_deleted", 0),
+                    properties_set=r.get("properties_set", 0),
+                    indices_created=r.get("indices_created", 0),
+                    indices_deleted=r.get("indices_deleted", 0),
+                )
+            )
+        return results
+
     def ro_query(self, cypher: str, params: Optional[Dict[str, Any]] = None) -> QueryResult:
         """Execute a read-only Cypher query."""
         return self.query(cypher, params=params)

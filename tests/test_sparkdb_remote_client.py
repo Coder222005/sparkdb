@@ -92,3 +92,85 @@ def test_remote_client_project_isolation(remote_server):
     client.drop_project("project_5g_core")
     client.drop_project("project_ran_oai")
 
+
+def test_remote_query_batch_parallel(remote_server):
+    host, port = remote_server
+    client = SparkDB(host=host, port=port)
+    g = client.select_graph("batch_test_graph")
+
+    # Ingest test nodes with variables
+    for i in range(20):
+        g.query(f"CREATE (e:Entity {{id: {i}, name: 'Node_{i}', val: {i * 10}}})")
+
+    # Issue 20 queries in a single parallel batch
+    queries = [
+        {"query": "MATCH (n:Entity {id: $id}) RETURN n.name AS name, n.val AS val", "params": {"id": i}}
+        for i in range(20)
+    ]
+
+    results = g.query_batch(queries, parallel=True, max_workers=4)
+    assert len(results) == 20
+    for i, r in enumerate(results):
+        assert r.header == ["name", "val"]
+        assert r.result_set == [[f"Node_{i}", i * 10]]
+
+    # Clean up
+    client.drop_graph("batch_test_graph")
+
+
+def test_remote_query_batch_with_mutations(remote_server):
+    host, port = remote_server
+    client = SparkDB(host=host, port=port)
+    g = client.select_graph("batch_mutation_graph")
+
+    # Batch with mixed creations and queries (triggers safe sequential execution)
+    batch = [
+        "CREATE (d1:Device {dev_id: 1, type: 'sensor'})",
+        "CREATE (d2:Device {dev_id: 2, type: 'gateway'})",
+        {"query": "MATCH (d:Device) RETURN count(d) AS total"},
+    ]
+
+    results = g.query_batch(batch, parallel=True)
+    assert len(results) == 3
+    assert results[0].nodes_created == 1
+    assert results[1].nodes_created == 1
+    assert results[2].result_set == [[2]]
+
+    client.drop_graph("batch_mutation_graph")
+
+
+def test_remote_query_batch_cold_project_prewarm(remote_server):
+    host, port = remote_server
+    client = SparkDB(host=host, port=port)
+
+    # Edge case: Query a cold graph that has never been instantiated or selected
+    cold_graph = client.select_graph("completely_cold_graph")
+    batch = [
+        "CREATE (c:ColdItem {code: 'ICE-01'})",
+        "MATCH (c:ColdItem) RETURN c.code AS code",
+    ]
+    results = cold_graph.query_batch(batch, parallel=True, max_workers=4)
+    assert len(results) == 2
+    assert results[0].nodes_created == 1
+    assert results[1].result_set == [["ICE-01"]]
+
+    client.drop_graph("completely_cold_graph")
+
+
+def test_embedded_query_batch(tmp_path):
+    # Test embedded in-process GraphClient query_batch
+    db = SparkDB(storage_dir=str(tmp_path))
+    g = db.select_graph("embedded_batch_graph")
+
+    g.query("CREATE (u1:User {uid: 101, role: 'admin'}), (u2:User {uid: 102, role: 'guest'})")
+
+    queries = [
+        {"query": "MATCH (u:User {uid: $uid}) RETURN u.role", "params": {"uid": 101}},
+        {"query": "MATCH (u:User {uid: $uid}) RETURN u.role", "params": {"uid": 102}},
+    ]
+    results = g.query_batch(queries, parallel=True, max_workers=2)
+    assert len(results) == 2
+    assert results[0].result_set == [["admin"]]
+    assert results[1].result_set == [["guest"]]
+
+
