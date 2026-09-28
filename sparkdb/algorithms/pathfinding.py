@@ -53,7 +53,7 @@ def multi_hop_paths(
                 if max_paths is None and len(next_paths) >= path_budget:
                     raise ValueError(f"Path expansion exceeds the maximum of {path_budget} paths")
                 next_paths.append(path + [int(nbr)])
-                if len(next_paths) >= path_budget:
+                if max_paths is not None and len(next_paths) >= path_budget:
                     break
             if max_paths is not None and len(next_paths) >= path_budget:
                 break

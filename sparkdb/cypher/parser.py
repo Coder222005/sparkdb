@@ -43,8 +43,8 @@ def substitute_params(query: str, params: Optional[Dict[str, Any]] = None) -> st
             rep = repr(val)
 
         # Replace $key (word boundary) and {key}
-        q = re.sub(rf"\${re.escape(key)}\b", rep, q)
-        q = re.sub(rf"\{{\s*{re.escape(key)}\s*\}}", rep, q)
+        q = re.sub(rf"\${re.escape(key)}\b", lambda _: rep, q)
+        q = re.sub(rf"\{{\s*{re.escape(key)}\s*\}}", lambda _: rep, q)
     return q
 
 
