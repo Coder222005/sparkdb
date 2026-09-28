@@ -76,7 +76,18 @@ class RemoteGraphClient:
                 response = HttpResponseWrapper(raw_resp)
                 return self._decode_response(response)
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8")
+            raw_err = e.read()
+            try:
+                if HAS_MSGPACK:
+                    try:
+                        err_obj = msgpack.unpackb(raw_err, raw=False)
+                        err_body = str(err_obj.get("error", err_obj))
+                    except Exception:
+                        err_body = raw_err.decode("utf-8")
+                else:
+                    err_body = raw_err.decode("utf-8")
+            except Exception:
+                err_body = str(raw_err)
             raise RuntimeError(f"SparkDB server error ({e.code}): {err_body}") from e
         except urllib.error.URLError as e:
             raise ConnectionError(f"Failed to connect to SparkDB server at {self.base_url}: {e.reason}") from e

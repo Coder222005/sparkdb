@@ -422,6 +422,71 @@ class CypherExecutor:
             ]
             return QueryResult(header=["source_label", "relationship_type", "target_label"], result_set=rows)
 
+        if "db.expand" in proc:
+            node_name = str(args[0]) if args else ""
+            limit = int(args[1]) if len(args) > 1 else 10
+            nids = list(self.graph.property_store.find_nodes_by_property("name", node_name))
+            if not nids:
+                return QueryResult(header=["source", "relationship", "target", "direction"], result_set=[])
+
+            raw_triples = []
+            referenced_nids = set(nids)
+
+            for target_nid in nids:
+                # Outgoing relations
+                for rel in self.graph.matrix_store.get_relationship_types():
+                    csr = self.graph.matrix_store.get_csr(rel)
+                    if target_nid < csr.shape[0]:
+                        r_start = csr.indptr[target_nid]
+                        r_end = csr.indptr[target_nid + 1]
+                        count = 0
+                        for dst in csr.indices[r_start:r_end]:
+                            dst_id = int(dst)
+                            raw_triples.append((target_nid, rel, dst_id, "outgoing"))
+                            referenced_nids.add(dst_id)
+                            count += 1
+                            if limit and count >= limit:
+                                break
+
+                # Incoming relations
+                for rel in self.graph.matrix_store.get_relationship_types():
+                    rev_csr = (
+                        self.graph.get_reverse_adjacency(rel)
+                        if hasattr(self.graph, "get_reverse_adjacency")
+                        else self.graph.matrix_store.get_csc(rel).tocsr()
+                    )
+                    if target_nid < rev_csr.shape[0]:
+                        r_start = rev_csr.indptr[target_nid]
+                        r_end = rev_csr.indptr[target_nid + 1]
+                        count = 0
+                        for src in rev_csr.indices[r_start:r_end]:
+                            src_id = int(src)
+                            raw_triples.append((src_id, rel, target_nid, "incoming"))
+                            referenced_nids.add(src_id)
+                            count += 1
+                            if limit and count >= limit:
+                                break
+
+            props_cache = (
+                self.graph.property_store.batch_get_nodes_properties(list(referenced_nids))
+                if hasattr(self.graph.property_store, "batch_get_nodes_properties")
+                else {nid: self.graph.property_store.get_node_properties(nid) for nid in referenced_nids}
+            )
+
+            rows = []
+            for src_id, rel, dst_id, direction in raw_triples:
+                src_props = props_cache.get(src_id, {})
+                dst_props = props_cache.get(dst_id, {})
+                src_name = src_props.get("name") or str(src_id)
+                dst_name = dst_props.get("name") or str(dst_id)
+                src_labels = self.graph.matrix_store.node_to_labels.get(src_id, set())
+                dst_labels = self.graph.matrix_store.node_to_labels.get(dst_id, set())
+                if "Chunk" in src_labels or "Chunk" in dst_labels:
+                    continue
+                rows.append([src_name, rel, dst_name, direction])
+
+            return QueryResult(header=["source", "relationship", "target", "direction"], result_set=rows)
+
         raise ValueError(f"Unknown procedure: {details['procedure']}")
 
     def _execute_match(self, details: Dict[str, Any]) -> QueryResult:
@@ -435,61 +500,65 @@ class CypherExecutor:
             return QueryResult()
 
         start_desc = nodes[0]
-        start_ids = self._find_candidate_node_ids(start_desc.get("label"), start_desc.get("properties", {}))
+        end_desc = nodes[-1] if len(nodes) > 1 else None
+        start_has_props = bool(start_desc.get("properties"))
+        end_has_props = bool(end_desc.get("properties")) if end_desc else False
+
         projections = self._parse_return_projections(ret_clause)
         header = [alias for expr, alias in projections]
-
-        if not start_ids:
-            return QueryResult(header=header, result_set=[])
 
         limit_val = details.get("limit")
         skip_val = details.get("skip") or 0
         fetch_limit = (skip_val + limit_val) if (limit_val is not None and not details.get("order_by") and not details.get("where")) else None
 
-        # Cost-Based Optimizer (CBO) & Cardinality Stats:
-        # For 1-hop or 2-hop traversals (a:LabelA)-[:REL]->(b:LabelB), check candidate set cardinality of a vs b.
-        # If b has significantly fewer candidates than a (len(b_candidates) < len(a_candidates) / 3)
-        # and the reverse adjacency matrix is available, execute traversal backward from b to a
-        # or prune the search space from the smaller root.
-        paths = None
-        if len(rels) in (1, 2) and len(nodes) == len(rels) + 1:
-            end_desc = nodes[-1]
-            end_ids = self._find_candidate_node_ids(end_desc.get("label"), end_desc.get("properties", {}))
+        can_reverse = (
+            hasattr(self.graph, "get_reverse_adjacency")
+            or hasattr(self.graph.matrix_store, "get_reverse_adjacency")
+            or hasattr(self.graph.matrix_store, "get_csc")
+        )
 
-            # Early pruning if destination candidate set is empty
+        paths = None
+        if len(rels) in (1, 2) and len(nodes) == len(rels) + 1 and can_reverse and end_has_props and not start_has_props:
+            end_ids = self._find_candidate_node_ids(end_desc.get("label"), end_desc.get("properties", {}))
             if not end_ids:
                 return QueryResult(header=header, result_set=[])
-
-            # Also check intermediate node if 2-hop
-            if len(rels) == 2:
-                mid_desc = nodes[1]
-                if mid_desc.get("label") or mid_desc.get("properties"):
-                    mid_ids = self._find_candidate_node_ids(mid_desc.get("label"), mid_desc.get("properties", {}))
-                    if not mid_ids:
-                        return QueryResult(header=header, result_set=[])
-
-            can_reverse = (
-                hasattr(self.graph, "get_reverse_adjacency")
-                or hasattr(self.graph.matrix_store, "get_reverse_adjacency")
-                or hasattr(self.graph.matrix_store, "get_csc")
+            paths = self._execute_backward_traversal(
+                nodes=nodes,
+                rels=rels,
+                start_ids=None,
+                end_ids=end_ids,
+                start_label=start_desc.get("label"),
+                fetch_limit=fetch_limit,
             )
-            if can_reverse and len(start_ids) > 0 and len(end_ids) < len(start_ids) / 3:
-                paths = self._execute_backward_traversal(
-                    nodes=nodes,
-                    rels=rels,
-                    start_ids=start_ids,
-                    end_ids=end_ids,
-                    fetch_limit=fetch_limit,
-                )
 
         if paths is None:
-            paths = algos.multi_hop_paths(
-                self.graph.matrix_store,
-                start_node_ids=start_ids,
-                rel_path=rels,
-                target_label=nodes[-1].get("label") if len(nodes) > 1 else None,
-                max_paths=fetch_limit,
-            )
+            start_ids = self._find_candidate_node_ids(start_desc.get("label"), start_desc.get("properties", {}))
+            if not start_ids:
+                return QueryResult(header=header, result_set=[])
+
+            if len(rels) in (1, 2) and len(nodes) == len(rels) + 1:
+                if end_has_props or len(start_ids) > 50:
+                    end_ids = self._find_candidate_node_ids(end_desc.get("label"), end_desc.get("properties", {}))
+                    if not end_ids:
+                        return QueryResult(header=header, result_set=[])
+
+                    if can_reverse and len(start_ids) > 0 and len(end_ids) < len(start_ids) / 3:
+                        paths = self._execute_backward_traversal(
+                            nodes=nodes,
+                            rels=rels,
+                            start_ids=start_ids,
+                            end_ids=end_ids,
+                            fetch_limit=fetch_limit,
+                        )
+
+            if paths is None:
+                paths = algos.multi_hop_paths(
+                    self.graph.matrix_store,
+                    start_node_ids=start_ids,
+                    rel_path=rels,
+                    target_label=nodes[-1].get("label") if len(nodes) > 1 else None,
+                    max_paths=fetch_limit,
+                )
 
         # Vectorized pre-fetch all node properties across candidate paths in ONE batch
         all_nids: Set[int] = set()
@@ -664,12 +733,14 @@ class CypherExecutor:
         self,
         nodes: List[Dict[str, Any]],
         rels: List[str],
-        start_ids: List[int],
+        start_ids: Optional[List[int]],
         end_ids: List[int],
+        start_label: Optional[str] = None,
         fetch_limit: Optional[int] = None,
     ) -> List[List[int]]:
         """Execute backward traversal from end candidates to start candidates using reverse adjacency."""
-        a_cand_set = set(start_ids)
+        a_cand_set = set(start_ids) if start_ids is not None else None
+        node_to_labels = getattr(self.graph.matrix_store, "node_to_labels", {})
         paths: List[List[int]] = []
 
         def get_rev_csr(rel_type: str):
@@ -678,6 +749,13 @@ class CypherExecutor:
             if hasattr(self.graph.matrix_store, "get_reverse_adjacency"):
                 return self.graph.matrix_store.get_reverse_adjacency(rel_type)
             return self.graph.matrix_store.get_csc(rel_type).tocsr()
+
+        def is_valid_start(src_id: int) -> bool:
+            if a_cand_set is not None:
+                return src_id in a_cand_set
+            if start_label:
+                return start_label in node_to_labels.get(src_id, set())
+            return True
 
         if len(rels) == 1:
             rev_csr = get_rev_csr(rels[0])
@@ -688,7 +766,7 @@ class CypherExecutor:
                 r_end = rev_csr.indptr[dst + 1]
                 for src in rev_csr.indices[r_start:r_end]:
                     src_id = int(src)
-                    if src_id in a_cand_set:
+                    if is_valid_start(src_id):
                         paths.append([src_id, dst])
                         if fetch_limit and len(paths) >= fetch_limit:
                             return paths
@@ -718,7 +796,7 @@ class CypherExecutor:
                     r_end1 = rev_csr1.indptr[b_node + 1]
                     for a_nbr in rev_csr1.indices[r_start1:r_end1]:
                         a_node = int(a_nbr)
-                        if a_node in a_cand_set:
+                        if is_valid_start(a_node):
                             paths.append([a_node, b_node, c_node])
                             if fetch_limit and len(paths) >= fetch_limit:
                                 return paths

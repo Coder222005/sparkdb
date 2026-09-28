@@ -54,8 +54,11 @@ def multi_hop_paths(
             break
 
     if target_label:
-        valid_targets = matrix_store.get_nodes_with_label(target_label)
-        current_paths = [p for p in current_paths if p[-1] in valid_targets]
+        if hasattr(matrix_store, "node_to_labels"):
+            current_paths = [p for p in current_paths if target_label in matrix_store.node_to_labels.get(p[-1], set())]
+        else:
+            valid_targets = matrix_store.get_nodes_with_label(target_label)
+            current_paths = [p for p in current_paths if p[-1] in valid_targets]
 
     if max_paths:
         return current_paths[:max_paths]
