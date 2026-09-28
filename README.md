@@ -8,7 +8,6 @@
 **SparkDB** is an enterprise-grade, clean-room graph database engine designed as a **100% permissively licensed (BSD 3-Clause)** drop-in replacement for **FalkorDB** and **RedisGraph**.
 
 Built from the ground up using **GraphBLAS sparse linear algebra**, SparkDB models graph topologies as sparse adjacency matrices (CSR/CSC). It pairs vectorized matrix multiplications with an ACID SQLite Write-Ahead Logging (WAL) property engine, an openCypher query executor with Cost-Based Optimization (CBO), and built-in HNSW vector search.
-
 ---
 
 ## Key Features
